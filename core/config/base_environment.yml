@@ -72,7 +72,7 @@ wandb_run: Gradients-Rollout
 wandb_runid: default
 
 eval_table_size:
-max_steps: 1000
+max_steps: 30
 debug:
 deepspeed:
 weight_decay: 0.0
