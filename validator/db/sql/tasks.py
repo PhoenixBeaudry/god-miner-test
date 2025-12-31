@@ -230,66 +230,14 @@ async def _insert_grpo_task(connection: Connection, task: GrpoRawTask, task_reco
 async def _insert_env_task(connection: Connection, task: EnvRawTask, task_record: dict) -> None:
     query_env = f"""
         INSERT INTO {cst.ENV_TASKS_TABLE}
-        ({cst.TASK_ID}, {cst.FIELD_PROMPT}, {cst.FILE_FORMAT}, {cst.FIELD_EXTRA_COLUMN})
-        VALUES ($1, $2, $3, $4)
+        ({cst.TASK_ID}, {cst.ENVIRONMENT_NAME})
+        VALUES ($1, $2)
     """
     await connection.execute(
         query_env,
         task_record[cst.TASK_ID],
-        task.field_prompt,
-        task.file_format,
-        task.extra_column,
+        task.environment_name
     )
-
-    query_rollout_function = f"""
-        WITH ins AS (
-            INSERT INTO {cst.ENV_TASK_ROLLOUT_TABLE}
-            ({cst.ROLLOUT_FUNC}, {cst.FUNC_HASH}, {cst.IS_GENERIC})
-            VALUES ($1, $2, $3)
-            ON CONFLICT ({cst.FUNC_HASH}) DO NOTHING
-            RETURNING {cst.ROLLOUT_ID}
-        )
-        SELECT {cst.ROLLOUT_ID} FROM ins
-        UNION ALL
-        SELECT {cst.ROLLOUT_ID} FROM {cst.ENV_TASK_ROLLOUT_TABLE} WHERE {cst.FUNC_HASH} = $2
-        LIMIT 1
-    """
-    rollout_id = await connection.fetchval(
-        query_rollout_function, task.rollout_function.rollout_func, task.rollout_function.func_hash, task.rollout_function.is_generic
-    )
-
-    query_env_task_functions = f"""
-        INSERT INTO {cst.ENV_TASK_FUNCTIONS_TABLE}
-        ({cst.TASK_ID}, {cst.ROLLOUT_ID})
-        VALUES ($1, $2, $3)
-    """
-    await connection.execute(query_env_task_functions, task_record[cst.TASK_ID], rollout_id)
-
-
-    for reward_function in task.reward_functions:
-        query_reward_functions = f"""
-            WITH ins AS (
-                INSERT INTO {cst.REWARD_FUNCTIONS_TABLE}
-                ({cst.REWARD_FUNC}, {cst.FUNC_HASH}, {cst.IS_GENERIC})
-                VALUES ($1, $2, $3)
-                ON CONFLICT ({cst.FUNC_HASH}) DO NOTHING
-                RETURNING {cst.REWARD_ID}
-            )
-            SELECT {cst.REWARD_ID} FROM ins
-            UNION ALL
-            SELECT {cst.REWARD_ID} FROM {cst.REWARD_FUNCTIONS_TABLE} WHERE {cst.FUNC_HASH} = $2
-            LIMIT 1
-        """
-        reward_id = await connection.fetchval(
-            query_reward_functions, reward_function.reward_func, reward_function.func_hash, reward_function.is_generic
-        )
-
-        query_env_task_functions = f"""
-            INSERT INTO {cst.ENV_TASK_FUNCTIONS_TABLE}
-            ({cst.TASK_ID}, {cst.REWARD_ID}, {cst.REWARD_WEIGHT})
-            VALUES ($1, $2, $3)
-        """
-        await connection.execute(query_env_task_functions, task_record[cst.TASK_ID], reward_id, reward_function.reward_weight)
 
 
 async def get_nodes_assigned_to_task(task_id: str, psql_db: PSQLDB) -> list[Node]:
@@ -407,7 +355,7 @@ async def get_tasks_with_status(
                 """
             elif task_type == TaskType.ENVIRONMENTTASK.value:
                 specific_query = f"""
-                    SELECT t.*, et.field_prompt, et.file_format, et.extra_column
+                    SELECT t.*, et.environment_name
                     FROM {cst.TASKS_TABLE} t
                     LEFT JOIN {cst.ENV_TASKS_TABLE} et ON t.{cst.TASK_ID} = et.{cst.TASK_ID}
                     WHERE t.{cst.TASK_ID} = $1
@@ -447,6 +395,8 @@ async def get_tasks_with_status(
                     tasks.append(GrpoRawTask(**task_data, reward_functions=reward_functions))
                 elif task_type == TaskType.CHATTASK.value:
                     tasks.append(ChatRawTask(**task_data))
+                elif task_type == TaskType.ENVIRONMENTTASK.value:
+                    tasks.append(EnvRawTask(**task_data))
 
         logger.info(f"Retrieved {len(tasks)} tasks with status {status.value}")
         return tasks
@@ -587,6 +537,19 @@ async def update_task(updated_task: AnyTypeRawTask, psql_db: PSQLDB) -> AnyTypeR
                     await delete_reward_functions(updated_task.task_id, psql_db)
                     reward_functions = [RewardFunction(**reward_function) for reward_function in updates["reward_functions"]]
                     await add_reward_functions(updated_task.task_id, reward_functions, psql_db)
+            elif updated_task.task_type == TaskType.ENVIRONMENTTASK:
+                env_fields = await get_table_fields(cst.ENV_TASKS_TABLE, connection)
+                env_specific_fields = [f for f in env_fields if f != cst.TASK_ID]
+                specific_updates = {k: v for k, v in updates.items() if k in env_specific_fields}
+                if specific_updates:
+                    specific_clause = ", ".join([f"{column} = ${i + 2}" for i, column in enumerate(specific_updates.keys())])
+                    specific_values = list(specific_updates.values())
+                    query = f"""
+                        UPDATE {cst.ENV_TASKS_TABLE}
+                        SET {specific_clause}
+                        WHERE {cst.TASK_ID} = $1
+                    """
+                    await connection.execute(query, updated_task.task_id, *specific_values)
 
             if updated_task.assigned_miners is not None:
                 await connection.execute(
@@ -718,6 +681,7 @@ async def get_detailed_task_stats(psql_db: PSQLDB, include_tournament_tasks=Fals
             TaskType.INSTRUCTTEXTTASK.value: "instruct",
             TaskType.DPOTASK.value: "dpo",
             TaskType.GRPOTASK.value: "grpo",
+            TaskType.ENVIRONMENTTASK.value: "env",
             TaskType.CHATTASK.value: "chat",
             TaskType.IMAGETASK.value: "image",
         }
@@ -823,6 +787,13 @@ async def get_task(task_id: UUID, psql_db: PSQLDB, connection: Connection | None
                 LEFT JOIN {cst.GRPO_TASKS_TABLE} gt ON t.{cst.TASK_ID} = gt.{cst.TASK_ID}
                 WHERE t.{cst.TASK_ID} = $1
             """
+        elif task_type == TaskType.ENVIRONMENTTASK.value:
+            specific_query = f"""
+                SELECT t.*, et.environment_name
+                FROM {cst.TASKS_TABLE} t
+                LEFT JOIN {cst.ENV_TASKS_TABLE} et ON t.{cst.TASK_ID} = et.{cst.TASK_ID}
+                WHERE t.{cst.TASK_ID} = $1
+            """
         elif task_type == TaskType.CHATTASK.value:
             specific_query = f"""
                 SELECT
@@ -860,6 +831,8 @@ async def get_task(task_id: UUID, psql_db: PSQLDB, connection: Connection | None
             return GrpoRawTask(**full_task_data, reward_functions=reward_functions)
         elif task_type == TaskType.CHATTASK.value:
             return ChatRawTask(**full_task_data)
+        elif task_type == TaskType.ENVIRONMENTTASK.value:
+            return EnvRawTask(**full_task_data)
 
     if connection is not None:
         return await _get_task_inner(connection)
@@ -972,7 +945,7 @@ async def get_task_by_id(task_id: UUID, psql_db: PSQLDB) -> AnyTypeTask:
                 {victorious_repo_cte}
                 SELECT
                     tasks.*,
-                    et.environment_name, et.file_format,
+                    et.environment_name,
                     COALESCE(tasks.training_repo_backup, victorious_repo.repo) as trained_model_repository
                 FROM {cst.TASKS_TABLE} tasks
                 LEFT JOIN {cst.ENV_TASKS_TABLE} et ON tasks.{cst.TASK_ID} = et.{cst.TASK_ID}
@@ -1138,7 +1111,7 @@ def _get_specific_query_for_task_type(task_type: str) -> str | None:
         """
     elif task_type == TaskType.ENVIRONMENTTASK.value:
         return f"""
-            SELECT t.*, et.environment_name, et.file_format
+            SELECT t.*, et.environment_name
             FROM {cst.TASKS_TABLE} t
             LEFT JOIN {cst.ENV_TASKS_TABLE} et ON t.{cst.TASK_ID} = et.{cst.TASK_ID}
             WHERE t.{cst.TASK_ID} = ANY($1)
@@ -1273,7 +1246,7 @@ async def get_tasks_by_account_id(psql_db: PSQLDB, account_id: UUID, limit: int 
                 tasks.append(GrpoTask(**task_data, reward_functions=reward_functions))
             elif task_type == TaskType.ENVIRONMENTTASK.value:
                 env_query = f"""
-                    SELECT environment_name, file_format
+                    SELECT environment_name
                     FROM {cst.ENV_TASKS_TABLE}
                     WHERE {cst.TASK_ID} = $1
                 """

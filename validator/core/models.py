@@ -23,7 +23,6 @@ from core.models.utility_models import ImageTextPair
 from core.models.utility_models import InstructTextDatasetType
 from core.models.utility_models import EnvironmentDatasetType
 from core.models.utility_models import RewardFunction
-from core.models.utility_models import RolloutFunction
 from core.models.utility_models import TaskType
 
 
@@ -168,7 +167,6 @@ class EnvRawTask(RawTask):
     """
 
     environment_name: str | None = None
-    file_format: FileFormat = FileFormat.HF
     task_type: TaskType = TaskType.ENVIRONMENTTASK
     synthetic_data: str | None = None
 
